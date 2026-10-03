@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-🔥 EXTREME DDoS Bot - Multi-Layer Attack Orchestrator
-Render Web App + Telegram Webhook Integration
-"""
 import os
 import sys
 import json
