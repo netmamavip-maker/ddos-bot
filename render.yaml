@@ -2,7 +2,7 @@ services:
   - type: web
     name: ddos-bot-extreme
     runtime: python
-    pythonVersion: 3.11
+    pythonVersion: 3.11.9
     buildCommand: pip install --no-cache-dir -r requirements.txt
     startCommand: python app/main.py
     envVars:
