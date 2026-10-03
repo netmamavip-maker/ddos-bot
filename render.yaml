@@ -24,6 +24,3 @@ services:
       - key: MAX_DURATION
         scope: runtime
         value: 3600
-    routes:
-      - path: /
-        matchType: prefix
