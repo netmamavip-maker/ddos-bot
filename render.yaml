@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: ddos-bot-extreme
+    runtime: python
+    pythonVersion: 3.11
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT --timeout 120 app.main:app
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        scope: runtime
+      - key: WEBHOOK_URL
+        scope: runtime
+      - key: PORT
+        scope: runtime
+        value: 10000
+      - key: ENVIRONMENT
+        scope: runtime
+        value: production
+      - key: AUTHORIZED_USERS
+        scope: runtime
+        value: "YOUR_USER_ID"
+      - key: MAX_THREADS
+        scope: runtime
+        value: 5000
+      - key: MAX_DURATION
+        scope: runtime
+        value: 3600
