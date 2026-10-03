@@ -4,7 +4,7 @@ services:
     runtime: python
     pythonVersion: 3.11
     buildCommand: pip install --no-cache-dir -r requirements.txt
-    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT --timeout 120 app.main:app
+    startCommand: python app/main.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         scope: runtime
@@ -18,10 +18,12 @@ services:
         value: production
       - key: AUTHORIZED_USERS
         scope: runtime
-        value: "YOUR_USER_ID"
       - key: MAX_THREADS
         scope: runtime
         value: 5000
       - key: MAX_DURATION
         scope: runtime
         value: 3600
+    routes:
+      - path: /
+        matchType: prefix
