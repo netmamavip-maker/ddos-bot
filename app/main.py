@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""
+🔥 DDoS Bot - Pure Socket Implementation
+Uses direct polling instead of webhook - eliminates httpx/httpcore issues
+"""
 import os
 import json
 import logging
